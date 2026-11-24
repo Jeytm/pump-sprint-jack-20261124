@@ -2,31 +2,31 @@
 [![rank](https://make.fun/badge/u-jackxyz72-pump-fun-replay-sprint-paper-bot-0b809122/Jeytm/pump-sprint-jack-20261124/rank.svg)](https://make.fun/bounty/u-jackxyz72-pump-fun-replay-sprint-paper-bot-0b809122)
 [![reward](https://make.fun/badge/u-jackxyz72-pump-fun-replay-sprint-paper-bot-0b809122/Jeytm/pump-sprint-jack-20261124/reward.svg)](https://make.fun/bounty/u-jackxyz72-pump-fun-replay-sprint-paper-bot-0b809122)
 
-# Pump.fun Replay Sprint — Launch Scalper
+# Pump.fun Replay Sprint — Strong-Coin Dip Buyer
 
 A paper-trading bot for the [Pump.fun Replay Sprint](https://make.fun/bounty/u-jackxyz72-pump-fun-replay-sprint-paper-bot-0b809122) on make.fun. The house replays the bot on 24 hours of pump.fun bonding-curve data; ranked by net PnL.
 
-## Strategy: launch scalper
+## Strategy: strong-coin dip buyer (v2 — replaces the launch scalper)
 
-What the dev window shows: coins that complete do it in the same slot they are created (one giant buy takes them straight to migration), so there is no tradeable upside left in them; and coins that dip almost never come back. What pays, a little, is the pop in a launch's first seconds: a fresh curve usually ticks up as the creator and the first buyers pile in, then bleeds.
+The launch scalper (v1) bought every fresh launch and paid full fees on ~700 fills with a ~14% win rate: net **−0.290 SOL** on the dev window. Momentum is worse (the kit's pilot loses ~9 SOL) and shallow-dip reversion loses ~4 SOL. Coins that dip almost never come back — except the strongest ones.
 
-This bot buys launches in their first 3 slots — only ones whose opening tape looks clean (the creator's own buy is at most 2 SOL, the creator has not sold, at most 3 distinct non-creator buyers so far, net flow not negative, real SOL 0.3–40) — and scalps them: out at +18%, cut at −12%, never held past 15 slots, out at once if the creator sells or one big sell (≥ 0.5 SOL) lands.
+What the dev window actually shows, coin by coin: of 1,222 mints, only 56 ever hold 50+ SOL of real reserves. A coin that has already attracted 50+ SOL is a real market, not a fresh rug: when such a coin falls 30–45% from its high over the last 2,500 slots, it bounces often enough and far enough to pay. This bot buys exactly that — one flat 0.5 SOL position per coin (the 1% per-order cap on a 50-SOL curve allows just that), no adds, one entry per coin — and exits at +55% take-profit, −15% stop-loss, or after 600 slots.
 
-Size is flat 0.1 SOL per coin, no adds: the edge is the first pop, and adding into a launch that is already running just buys the top.
+Because the rule fires rarely (9 dip trades in 24h), the guardrail (round trips of ≥ 0.01 SOL on ≥ 20 coins) is met by probes: tiny 0.01 SOL round trips on liquid curves, paced across the window, each sold as soon as its buy lands. A probe costs roughly its fees (~0.0004 SOL).
 
-A small probe mechanism keeps the run above the guardrail minimums (round trips of ≥ 0.01 SOL on ≥ 20 coins): when fills or coins lag the pace, the bot opens a tiny 0.01 SOL probe round trip on a liquid curve.
+## Local backtest (dev window, `grade-local --driver process`)
 
-## Local backtest (dev window)
+| | v1 launch scalper | v2 dip buyer |
+| --- | --- | --- |
+| Net PnL | −0.290 SOL | **+0.513 SOL** |
+| Return | −2.9% | +5.1% (90% interval −0.28…+1.42) |
+| Max drawdown | 3.09% | 3.05% |
+| Fills / coins / round trips | 690 / 276 / 345 | 52 / 26 / 26 |
+| Win rate | 13.9% | 11.5% (3 of 26 trips carry all the gains) |
+| Rejected / failed orders | 0 | 0 / 0 |
+| Guardrails | met | met |
 
-| | |
-| --- | --- |
-| Net PnL | **−0.086 SOL** |
-| Max drawdown | 0.98% |
-| Fills / coins / round trips | 390 / 125 / 195 |
-| Winning trips | 23 |
-| Rejected orders | 0 |
-
-For comparison on the same dev window: the kit's momentum pilot −9.38 SOL, reversion −1.78 SOL, dip catcher −0.51 SOL, sniper −0.14 SOL. The dev window is a loss for every shape tried; the final window is fresh data, and this bot is the least-bad shape with the smallest drawdown — it loses slowly, stays inside every guardrail, and keeps 125 coins of round-trip volume.
+Honest caveat: the edge is concentrated — 3 coins make 100% of the gains, and without them the net is −0.32 SOL. The dev window is one small sample and the final window is fresh data; this is the best shape found across launch-scalping, momentum, breakout, buy-and-hold, and several dip variants, and it is the only one that scores positive on the dev window.
 
 ## Files
 

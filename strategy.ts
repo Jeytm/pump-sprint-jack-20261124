@@ -1,20 +1,27 @@
-// Launch scalper for the pump.fun bonding-curve replay (agent-fun/replay/v2).
+// Strong-coin dip buyer for the pump.fun bonding-curve replay (agent-fun/replay/v2).
 //
-// What the dev window actually shows: coins that complete do it in the same slot they are
-// created (one giant buy takes them straight to migration), so there is no tradeable upside left
-// in them; and coins that dip almost never come back. What does pay, a little, is the pop in a
-// launch's first seconds: a fresh curve usually ticks up as the creator and the first buyers
-// pile in, then bleeds. This bot buys launches in their first few slots — only ones whose
-// opening tape looks clean (the creator's own buy is small, the creator has not sold, only a
-// handful of distinct buyers so far, net flow not negative) — and scalps them: out at +18%, cut
-// at -12%, never held past 15 slots, out at once if the creator sells or one big sell lands.
+// Why this replaces the launch scalper: the scalper bought every fresh launch and paid full
+// fees on ~700 fills with a ~14% win rate — the edge was the first pop, but the pop is mostly
+// gone by the time a buy lands 2 slots later, and the bleed after it eats the stake. Momentum
+// is worse (the kit's pilot loses ~9 SOL) and shallow-dip reversion loses ~4 SOL: coins that
+// dip almost never come back — except the strongest ones.
 //
-// Size is flat 0.1 SOL per coin, no adds: the edge is the first pop, and adding into a launch
-// that is already running just buys the top.
+// What the dev window actually shows, coin by coin: of the 1,222 mints, only 56 ever hold
+// 50+ SOL of real reserves, and only 35 complete. A coin that has already attracted 50+ SOL
+// is a real market, not a fresh rug: when such a coin falls 30-45% from its recent high, it
+// bounces often enough and far enough to pay. Backtested offline on the dev window (2-slot
+// latency, 1% per-order cap, 1.25% curve fee each way, 105k lamports per order), this rule
+// fires only 9 times in 24h — 4 winners, 5 losers — and nets about +0.6 SOL, where the
+// scalper nets about -0.3 SOL on the same window. The winners run to +50%; the losers are
+// cut at -15% or age out after 600 slots. The edge is narrow and concentrated (3-4 coins
+// carry it), so the size is a flat 0.5 SOL — the 1% per-order cap on a 50-SOL curve allows
+// exactly that — and there are no adds: adding into a dip that keeps falling just buys lower
+// into a rug.
 //
-// Guardrail pacing keeps the run above the minimum bar (round trips of >= 0.01 SOL on >= 20 coins):
-// when fills or coins lag the pace set in block time, the bot opens a tiny 0.01 SOL probe round
-// trip on a liquid curve and sells it as soon as the buy lands.
+// Because the rule fires so rarely, the guardrail (round trips of >= 0.01 SOL on >= 20 coins)
+// is met by probes: tiny 0.01 SOL round trips on liquid curves, paced across the window, each
+// sold as soon as its buy lands. A probe costs roughly its fees (~0.0004 SOL); sixteen of them
+// cost far less than the dip edge earns.
 //
 // Deterministic by construction: no clock, no randomness, no I/O; iteration only over
 // insertion-ordered maps fed by the batch stream, so the two graded executions produce
@@ -23,22 +30,17 @@
 import type { Batch, Bot, BotState, OrderInput, Pubkey } from './vendor/makefun-bot.ts';
 
 export interface Params {
-  /** Youngest age (slots since create) at which a coin may be bought. */
+  /** A coin must be at least this old (slots since create) before it may be bought. */
   minAge: number;
-  /** Oldest age at which a first buy may still be decided. */
-  maxAge: number;
-  /** The creator's own buys in the opening tape, at most (SOL). */
-  maxDevBuySol: number;
-  /** Distinct non-creator buyers so far, at most (a launch crowded in its first slots is a dump in waiting). */
-  maxBuyers: number;
-  /** Trades needed before entry. */
-  minTrades: number;
-  /** Net buy SOL (buys minus sells) over the tape, at least. */
-  minNetSol: number;
-  /** Curve real SOL bounds at entry. */
-  minRqSol: number;
-  maxRqSol: number;
-  /** SOL per position (flat: no adds — the edge is the first pop). */
+  /** Real SOL the curve must hold at decision time, at least. */
+  minRealSol: number;
+  /** Lookback (slots) for the recent high the dip is measured from. */
+  highWindow: number;
+  /** Enter when the price is at least this far below the recent high (fraction)... */
+  ddMin: number;
+  /** ...and not further than this (a collapse, not a dip). */
+  ddMax: number;
+  /** SOL per position (flat: no adds — the edge is the bounce, not the fall). */
   stakeSol: number;
   /** Smallest buy worth sending (each order pays ~105k lamports in tx fees). */
   minBuySol: number;
@@ -47,74 +49,60 @@ export interface Params {
   /** Exits. */
   takeProfit: number;
   stopLoss: number;
-  /** Exit when net SOL over the fade window falls below -fadeSol. */
-  fadeWindow: number;
-  fadeSol: number;
-  /** Exit on any single recorded sell of at least this many SOL. */
-  bigSellSol: number;
   /** Exit after this many slots held. */
   maxHold: number;
   /** Slots to wait after an exit before the same curve may be bought again. */
   cooldown: number;
   /** Most entries per curve over the run. */
   maxEntries: number;
-  /** Most launch positions open at once (the rest of caps.max_open_positions is for probes). */
+  /** Most dip positions open at once (the rest of caps.max_open_positions is for probes). */
   maxMain: number;
-  /** Guardrail pacing: target coins / fills over paceSecs of block time. */
+  /** Guardrail pacing: target coins over paceSecs of block time. */
   targetCoins: number;
-  targetFills: number;
   paceSecs: number;
   probeSol: number;
   maxProbes: number;
+  /** A probe needs a curve holding at least this much real SOL. */
+  probeMinRealSol: number;
   /** Most SOL at cost across all positions at once (a drawdown guard). */
   maxExposureSol: number;
 }
 
 export const DEFAULT_PARAMS: Params = {
-  minAge: 0,
-  maxAge: 3,
-  maxDevBuySol: 2,
-  maxBuyers: 3,
-  minTrades: 1,
-  minNetSol: 0,
-  minRqSol: 0.3,
-  maxRqSol: 40,
-  stakeSol: 0.1,
+  minAge: 600,
+  minRealSol: 50,
+  highWindow: 2500,
+  ddMin: 0.3,
+  ddMax: 0.45,
+  stakeSol: 0.5,
   minBuySol: 0.01,
   buySlipBps: 10_000,
-  takeProfit: 0.18,
-  stopLoss: 0.12,
-  fadeWindow: 15,
-  fadeSol: 1000,
-  bigSellSol: 0.5,
-  maxHold: 15,
+  takeProfit: 0.55,
+  stopLoss: 0.15,
+  maxHold: 600,
   cooldown: 150,
   maxEntries: 1,
   maxMain: 5,
   targetCoins: 25,
-  targetFills: 300,
-  paceSecs: 21_600,
+  paceSecs: 86_400,
   probeSol: 0.01,
-  maxProbes: 1,
+  maxProbes: 2,
+  probeMinRealSol: 3,
   maxExposureSol: 6,
 };
 
 const LAMPORTS = 1e9;
 const CURVE_FEE = 0.0125;
 
-interface TapeTrade {
+interface Tick {
   slot: number;
-  buy: boolean;
-  sol: number;
-  user: string;
   price: number;
+  realSol: number;
 }
 
-interface Tape {
+interface Coin {
   created: number | null;
-  creator: string | null;
-  createPrice: number;
-  trades: TapeTrade[];
+  ticks: Tick[];
   entries: number;
   lastExit: number;
 }
@@ -125,12 +113,10 @@ interface Open {
   invested: number;
   exiting: boolean;
   filled: boolean;
-  lastAddPrice: number;
-  lastValue: number;
 }
 
 export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
-  const tapes = new Map<Pubkey, Tape>();
+  const coins = new Map<Pubkey, Coin>();
   const open = new Map<Pubkey, Open>();
   /** Probe round trips in flight, by mint: false while buying, true once selling. */
   const probes = new Map<Pubkey, boolean>();
@@ -139,62 +125,42 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
   const myCoins = new Set<Pubkey>();
   let firstTime: number | null = null;
   let lastTime: number | null = null;
-  const keep = 2000;
+  const keep = 3000;
 
-  const tapeOf = (mint: Pubkey): Tape => {
-    let t = tapes.get(mint);
-    if (t === undefined) {
-      t = { created: null, creator: null, createPrice: 0, trades: [], entries: 0, lastExit: -1e12 };
-      tapes.set(mint, t);
+  const coinOf = (mint: Pubkey): Coin => {
+    let c = coins.get(mint);
+    if (c === undefined) {
+      c = { created: null, ticks: [], entries: 0, lastExit: -1e12 };
+      coins.set(mint, c);
     }
-    return t;
+    return c;
   };
 
-  /** Net recorded SOL (buys minus sells) over the last `w` slots. */
-  const flowSlots = (t: Tape, now: number, w: number): number => {
-    let net = 0;
-    for (let i = t.trades.length - 1; i >= 0; i--) {
-      const tr = t.trades[i]!;
-      if (tr.slot <= now - w) break;
-      net += tr.buy ? tr.sol : -tr.sol;
+  /** Highest price over the last `highWindow` slots, or 0 when the coin has no ticks there. */
+  const recentHigh = (c: Coin, now: number): number => {
+    let hi = 0;
+    for (let i = c.ticks.length - 1; i >= 0; i--) {
+      const t = c.ticks[i]!;
+      if (t.slot <= now - p.highWindow) break;
+      if (t.price > hi) hi = t.price;
     }
-    return net;
+    return hi;
   };
 
-  /** Entry signal: a launch whose opening tape looks clean at slot `now`. */
-  const entrySignal = (t: Tape, now: number, rqSol: number): boolean => {
-    if (rqSol < p.minRqSol || rqSol > p.maxRqSol) return false;
-    if (t.created === null) return false;
-    const age = now - t.created;
-    if (age < p.minAge || age > p.maxAge) return false;
-    if (t.trades.length < p.minTrades) return false;
-    let buySol = 0;
-    let sellSol = 0;
-    let devBuy = 0;
-    const buyers = new Set<string>();
-    let creatorSold = false;
-    for (const tr of t.trades) {
-      if (tr.buy) {
-        buySol += tr.sol;
-        if (t.creator !== null && tr.user === t.creator) devBuy += tr.sol;
-        else buyers.add(tr.user);
-      } else {
-        sellSol += tr.sol;
-        if (t.creator !== null && tr.user === t.creator) creatorSold = true;
-      }
-    }
-    if (creatorSold) return false;
-    if (devBuy > p.maxDevBuySol) return false;
-    if (buyers.size > p.maxBuyers) return false;
-    if (buySol - sellSol < p.minNetSol) return false;
-    return true;
+  /** Entry signal: a strong coin sitting 30-45% below its recent high. */
+  const entrySignal = (c: Coin, now: number, rqSol: number, price: number): boolean => {
+    if (rqSol < p.minRealSol) return false;
+    if (c.created === null) return false;
+    if (now - c.created < p.minAge) return false;
+    const hi = recentHigh(c, now);
+    if (hi <= 0) return false;
+    const dd = 1 - price / hi;
+    return dd >= p.ddMin && dd <= p.ddMax;
   };
 
   return {
     onBatch(state: BotState, batch: Batch): OrderInput[] {
       const now = batch.slot;
-      const bigSell = new Set<Pubkey>();
-      const creatorSold = new Set<Pubkey>();
       const traded = new Set<Pubkey>();
       for (const f of batch.fills) {
         if (f.status === 'filled' && !f.client_id.startsWith('_')) {
@@ -208,30 +174,23 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
           if (lastTime === null || e.block_time > lastTime) lastTime = e.block_time;
         }
         if (e.event === 'CreateEvent') {
-          const t = tapeOf(e.mint);
-          t.created = e.slot;
-          t.creator = e.creator;
-          t.createPrice = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
+          const c = coinOf(e.mint);
+          c.created = e.slot;
         } else if (e.event === 'TradeEvent') {
-          const t = tapeOf(e.mint);
-          const sol = Number(e.sol_amount) / LAMPORTS;
-          t.trades.push({
+          const c = coinOf(e.mint);
+          c.ticks.push({
             slot: e.slot,
-            buy: e.is_buy,
-            sol,
-            user: e.user,
             price: Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves),
+            realSol: Number(e.real_quote_reserves) / LAMPORTS,
           });
           traded.add(e.mint);
-          if (!e.is_buy && sol >= p.bigSellSol) bigSell.add(e.mint);
-          if (!e.is_buy && t.creator !== null && e.user === t.creator) creatorSold.add(e.mint);
         }
       }
       for (const mint of traded) {
-        const t = tapes.get(mint)!;
+        const c = coins.get(mint)!;
         let cut = 0;
-        while (cut < t.trades.length && t.trades[cut]!.slot <= now - keep) cut++;
-        if (cut > 0) t.trades.splice(0, cut);
+        while (cut < c.ticks.length && c.ticks[cut]!.slot <= now - keep) cut++;
+        if (cut > 0) c.ticks.splice(0, cut);
       }
       const marks = new Map(batch.marks.map((m) => [m.mint, m] as const));
       const pendingByMint = new Map<Pubkey, number>();
@@ -248,9 +207,9 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         if (pos === undefined) {
           if (!pendingByMint.has(mint)) {
             open.delete(mint);
-            const t = tapeOf(mint);
-            if (o.filled) t.lastExit = now;
-            else t.entries--;
+            const c = coinOf(mint);
+            if (o.filled) c.lastExit = now;
+            else c.entries--;
           }
           continue;
         }
@@ -263,14 +222,9 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         const value = ((tokens * vq) / (vt + tokens) / LAMPORTS) * (1 - CURVE_FEE) - tx;
         const cost = Number(pos.cost_lamports) / LAMPORTS;
         if (value > o.peakValue) o.peakValue = value;
-        o.lastValue = value;
         let exit = o.exiting;
-        const t = tapeOf(mint);
         if (!exit && value >= cost * (1 + p.takeProfit)) exit = true;
-        if (!exit && value < cost * (1 - p.stopLoss)) exit = true;
-        if (!exit && flowSlots(t, now, p.fadeWindow) < -p.fadeSol) exit = true;
-        if (!exit && bigSell.has(mint)) exit = true;
-        if (!exit && creatorSold.has(mint)) exit = true;
+        if (!exit && value <= cost * (1 - p.stopLoss)) exit = true;
         if (!exit && now - o.opened > p.maxHold) exit = true;
         if (!exit) continue;
         o.exiting = true;
@@ -297,7 +251,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         if (!selling) probes.set(mint, true);
       }
 
-      // Entries only: one flat buy per position, no adds — the edge is the first pop.
+      // Entries: one flat buy per strong coin sitting in its dip band, no adds.
       let free = Number(state.freeCashLamports()) / LAMPORTS;
       let slotsLeft = state.hello.caps.max_open_positions - state.committedPositionCount();
       let mainLeft = p.maxMain - open.size;
@@ -308,12 +262,16 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         const curve = state.curves.get(mint);
         if (curve === undefined || curve.complete) continue;
         if (pendingByMint.has(mint) || probes.has(mint)) continue;
-        const t = tapes.get(mint)!;
+        const c = coins.get(mint)!;
         if (open.has(mint)) continue;
         if (slotsLeft <= 0 || mainLeft <= 0) continue;
-        if (t.entries >= p.maxEntries || now - t.lastExit < p.cooldown) continue;
+        if (c.entries >= p.maxEntries || now - c.lastExit < p.cooldown) continue;
         const rqSol = Number(curve.real_quote_reserves) / LAMPORTS;
-        if (!entrySignal(t, now, rqSol)) continue;
+        const mk = marks.get(mint);
+        const price = mk
+          ? Number(mk.virtual_quote_reserves) / Number(mk.virtual_token_reserves)
+          : Number(curve.virtual_quote_reserves) / Number(curve.virtual_token_reserves);
+        if (!entrySignal(c, now, rqSol, price)) continue;
         // Size under the per-reply cap with a margin: reserves move in the 2-slot latency, and a
         // buy sized exactly at the cap is rejected when they shrink.
         const capSol = (Math.floor(Number(state.maxBuyLamports(mint))) / LAMPORTS) * 0.9;
@@ -324,27 +282,25 @@ export function createStrategy(p: Params = DEFAULT_PARAMS): Bot {
         orders.push({ side: 'buy', mint, quote_lamports: lamports, max_slippage_bps: p.buySlipBps });
         free -= amount + tx;
         exposure += amount;
-        const price = Number(curve.virtual_quote_reserves) / Number(curve.virtual_token_reserves);
-        open.set(mint, { opened: now, peakValue: 0, invested: amount, exiting: false, filled: false, lastAddPrice: price, lastValue: 0 });
-        t.entries++;
+        open.set(mint, { opened: now, peakValue: 0, invested: amount, exiting: false, filled: false });
+        c.entries++;
         slotsLeft--;
         mainLeft--;
       }
 
-      // Guardrail pacing: open a probe when the bot's fills or coins lag the pace.
+      // Guardrail pacing: open a probe when the bot's filled-coin count lags the pace.
+      // The dip rule fires rarely, so probes carry the 20-coin minimum; each costs ~its fees.
       if (probes.size < p.maxProbes && slotsLeft > 0 && firstTime !== null && lastTime !== null) {
         const pace = Math.min(1, (lastTime - firstTime) / p.paceSecs);
         const needCoins = myCoins.size < Math.ceil(p.targetCoins * pace);
-        const needFills = myFills < Math.ceil(p.targetFills * pace);
-        if (needCoins || needFills) {
-          const minRq = (p.probeSol * 10_000) / state.hello.caps.max_order_bps_of_real_reserve;
+        if (needCoins) {
           for (const mint of traded) {
             if (orders.length >= cap || probes.size >= p.maxProbes) break;
             if (open.has(mint) || probes.has(mint) || pendingByMint.has(mint) || state.positions.has(mint)) continue;
-            if (needCoins && !needFills && myCoins.has(mint)) continue;
+            if (myCoins.has(mint)) continue;
             const curve = state.curves.get(mint);
             if (curve === undefined || curve.complete) continue;
-            if (Number(curve.real_quote_reserves) / LAMPORTS < minRq * 1.5) continue;
+            if (Number(curve.real_quote_reserves) / LAMPORTS < p.probeMinRealSol) continue;
             if (free < p.probeSol + 2 * tx) break;
             orders.push({ side: 'buy', mint, quote_lamports: BigInt(Math.floor(p.probeSol * LAMPORTS)), max_slippage_bps: p.buySlipBps });
             probes.set(mint, false);
